@@ -44,6 +44,11 @@
 *******************************************************************************/
 
 typedef enum {
+	/* Both accelerometer and gyroscope are in the same stream.
+	 * The shape of each frame will be [2,3] as
+	 * Stream 0: {{ACCEL_X, ACCEL_Y, ACCEL_Z}, {GYRO_X, GYRO_Y, GYRO_Z}} */
+	BMI323_MODE_STREAM_COMBINED = 0,
+
     /* The accelerometer and gyroscope are split in two separate streams
      * each with the shape [3] as
      * Stream 0: {ACCEL_X, ACCEL_Y, ACCEL_Z}
@@ -81,11 +86,19 @@ typedef struct {
     /* The sample period in ticks */
     uint32_t period_tick;
 
-	/* Converted data as meter per second squared */
-	float accel_data[MAX_FRAMES_IN_CHUNK * AXIS_COUNT];
+    union
+	{
+    	struct {
+			/* Converted data as meter per second squared */
+			float accel_data[MAX_FRAMES_IN_CHUNK * AXIS_COUNT];
 
-	/* Converted data as degrees per second*/
-	float gyro_data[MAX_FRAMES_IN_CHUNK * AXIS_COUNT];
+			/* Converted data as degrees per second*/
+			float gyro_data[MAX_FRAMES_IN_CHUNK * AXIS_COUNT];
+    	};
+
+    	// For mode combined
+    	float data_combined[MAX_FRAMES_IN_CHUNK * SENSOR_COUNT * AXIS_COUNT];
+	};
 
     /* Number of frames collected in accel_data and gyro_data. */
     /* Cleared after each sent data-chunk. Equal or less than frames_in_chunk */
@@ -165,6 +178,10 @@ static float _lsb_to_dps(int16_t val, float dps, uint8_t bit_width)
     float half_scale = (float)((pow((double)power, (double)bit_width) / 2.0f));
 
     return (dps / (half_scale)) * (val);
+//    float tmps = (dps / (half_scale)) * (val);
+//
+//    tmps = tmps / 100.f;
+//    return tmps;
 }
 
 static bool _config_hw(dev_bmi323_t* dev, int rate, int accel_range, int gyro_range, stream_mode_t mode)
@@ -254,10 +271,13 @@ static bool _config_hw(dev_bmi323_t* dev, int rate, int accel_range, int gyro_ra
     config[0].cfg.acc.bwp = BMI3_ACC_BW_ODR_QUARTER;
 
     // To enable the accelerometer set the power mode to normal mode
-    config[0].cfg.acc.acc_mode = BMI3_ACC_MODE_NORMAL;
+    // config[0].cfg.acc.acc_mode = BMI3_ACC_MODE_NORMAL;
+    config[0].cfg.acc.acc_mode = BMI3_ACC_MODE_HIGH_PERF;
 
     // Set number of average samples for accel.
     config[0].cfg.acc.avg_num = BMI3_ACC_AVG64;
+    // config[0].cfg.acc.avg_num = BMI3_ACC_AVG1;
+
 
     // The Gyroscope bandwidth coefficient defines the 3 dB cutoff frequency in relation to the ODR
 	// Value   Name      Description
@@ -433,6 +453,8 @@ static bool _write_payload(
         return pb_write(ostream, (const pb_byte_t *)dev->accel_data, total_bytes);
     case BMI323_MODE_STREAM_ONLY_GYRO:
         return pb_write(ostream, (const pb_byte_t *)dev->gyro_data, total_bytes);
+    case BMI323_MODE_STREAM_COMBINED:
+    	return pb_write(ostream, (const pb_byte_t *)dev->data_combined, total_bytes);
     default:
         return false;
     }
@@ -459,6 +481,40 @@ static bool _read_hw(dev_bmi323_t* dev)
     if (result != BMI323_OK)
     {
     	return false;
+    }
+
+    if (dev->stream_mode == BMI323_MODE_STREAM_COMBINED)
+    {
+    	// We expect both (acc and gyr to be ready)
+		if (((int_status & BMI3_INT_STATUS_ACC_DRDY) == 0)
+				|| ((int_status & BMI3_INT_STATUS_GYR_DRDY) == 0))
+		{
+			return false;
+		}
+
+		float *dest = dev->data_combined + dev->frames_sampled * AXIS_COUNT * SENSOR_COUNT;
+
+		// Read acc.
+		result = bmi323_get_sensor_data(&data[0], 1, sensor);
+		if (result != BMI323_OK)
+		{
+			return false;
+		}
+
+		*dest++ = _lsb_to_mps2(data[0].sens_data.acc.x, dev->accel_range, sensor->resolution);
+		*dest++ = _lsb_to_mps2(data[0].sens_data.acc.y, dev->accel_range, sensor->resolution);
+		*dest++ = _lsb_to_mps2(data[0].sens_data.acc.z, dev->accel_range, sensor->resolution);
+
+    	// Read gyr.
+    	result = bmi323_get_sensor_data(&data[1], 1, sensor);
+    	if (result != BMI323_OK)
+		{
+			return false;
+		}
+
+    	*dest++ = _lsb_to_dps(data[1].sens_data.gyr.x, dev->gyro_range, sensor->resolution);
+		*dest++ = _lsb_to_dps(data[1].sens_data.gyr.y, dev->gyro_range, sensor->resolution);
+		*dest++ = _lsb_to_dps(data[1].sens_data.gyr.z, dev->gyro_range, sensor->resolution);
     }
 
     if (dev->stream_mode == BMI323_MODE_STREAM_BOTH)
@@ -654,6 +710,7 @@ static bool _configure_streams(protocol_t* protocol, int device, void* arg)
 	   case 0: mode = BMI323_MODE_STREAM_BOTH; break;
 	   case 1: mode = BMI323_MODE_STREAM_ONLY_ACCEL; break;
 	   case 2:mode = BMI323_MODE_STREAM_ONLY_GYRO; break;
+	   case 3:mode = BMI323_MODE_STREAM_COMBINED; break;
 	   default:
 		   protocol_set_device_status(
 				   protocol,
@@ -740,6 +797,12 @@ static bool _configure_streams(protocol_t* protocol, int device, void* arg)
            stream0_name = "Gyro";
            stream1_name = NULL;
            break;
+       case 3:
+    	   stream0_unit = "m/s\xc2\xb2, \xc2\xb0/s"; /* Meter per second squared, Degrees per second */
+    	   stream1_unit = NULL;
+    	   stream0_name = "Combined";
+    	   stream1_name = NULL;
+    	   break;
        default: return false;
     }
 
@@ -761,6 +824,24 @@ static bool _configure_streams(protocol_t* protocol, int device, void* arg)
             "Failed to add streams.");
         return true;
     }
+
+    if(mode == BMI323_MODE_STREAM_COMBINED) {
+		result = protocol_add_stream_rank(
+			protocol,
+			device,
+			stream0,
+			"Sensor",
+			2,
+			(const char* []) { "Accel", "Gyro" });
+		if(result != PROTOCOL_STATUS_SUCCESS) {
+			protocol_set_device_status(
+				protocol,
+				device,
+				protocol_DeviceStatus_DEVICE_STATUS_ERROR,
+				"Failed to add streams dimension.");
+			return true;
+		}
+	}
 
     /* Add optional stream #1 */
     if(stream1_name != NULL) {
@@ -960,8 +1041,8 @@ int dev_bmi323_register(protocol_t* protocol, cyhal_i2c_t* i2c)
         "Mode",
         "Stream Configuration",
         0,
-        (const char* []) { "Both", "Only Accel", "Only Gyro" },
-        3);
+        (const char* []) { "Both", "Only Accel", "Only Gyro", "Combined" },
+        4);
 
     if(status != PROTOCOL_STATUS_SUCCESS)
     {
